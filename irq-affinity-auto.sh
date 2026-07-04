@@ -21,6 +21,7 @@
 # Usage:  ./irq-affinity-auto.sh [--reduce-queues] [--dry-run] [--verbose]
 # ===========================================================================
 set -uo pipefail
+[[ $EUID -ne 0 ]] && { echo "[ERROR] must run as root"; exit 1; }
 LOG="/var/log/irq-affinity.log"
 exec > >(tee -a "$LOG") 2>&1
 echo "=== $(date) ==="
@@ -32,13 +33,54 @@ for arg in "$@"; do
         --reduce-queues) OPT_REDUCE=1   ;;
         --dry-run)       OPT_DRY=1      ;;
         --verbose|-v)    OPT_VERBOSE=1  ;;
-        --help|-h) echo "Usage: $0 [--reduce-queues] [--dry-run] [--verbose]"; exit 0 ;;
+        --help|-h)
+            echo "Usage: $0 [--reduce-queues] [--dry-run] [--verbose]"
+            echo "Non-dry runs write a rollback script to /tmp/irq/restore_<date>_<time>.sh"
+            exit 0 ;;
     esac
 done
 [[ $OPT_DRY -eq 1 ]] && echo "[DRY RUN] No changes will be applied"
 
+# ── Restore script ────────────────────────────────────────────────────────────
+# Every runtime write below snapshots the previous value into a rollback script
+# so a bad tuning run can be reverted without a reboot.
+RESTORE="" IRQBALANCE_RESTORE=""
+if [[ $OPT_DRY -eq 0 ]]; then
+    # Atomic create (no -p): fails if /tmp/irq exists as anything, including a
+    # symlink — no check-then-create race. A pre-existing dir is accepted only
+    # if it is already a root-owned real directory; root-owned entries in
+    # sticky /tmp cannot be swapped out by other users afterwards.
+    if ! mkdir -m 700 /tmp/irq 2>/dev/null; then
+        if [[ -L /tmp/irq || ! -d /tmp/irq || "$(stat -c '%u' /tmp/irq)" != "0" ]]; then
+            echo "[ERROR] /tmp/irq exists and is not a root-owned directory — refusing to write restore script"
+            exit 1
+        fi
+        chmod 700 /tmp/irq
+    fi
+    RESTORE="/tmp/irq/restore_$(date +%Y%m%d_%H%M%S).sh"
+    (
+        set -o noclobber
+        {
+            echo "#!/bin/bash"
+            echo "# Rollback for irq-affinity-auto.sh run of $(date)"
+            echo "# Restores pre-run values in write order: queue counts, IRQ affinity,"
+            echo "# XPS masks, rings/coalescing, then irqbalance (last, so it can rebalance"
+            echo "# any IRQs recreated by a queue-count restore). Lines fail independently."
+            echo "[[ \$EUID -ne 0 ]] && { echo 'run as root'; exit 1; }"
+        } > "$RESTORE"
+    ) || { echo "[ERROR] could not create $RESTORE (already exists?)"; exit 1; }
+    chmod 700 "$RESTORE"
+    echo "[OK] restore script: $RESTORE"
+fi
+snap() { [[ -n "$RESTORE" ]] && echo "$*" >> "$RESTORE" || true; }
+
 # ── Stop irqbalance ───────────────────────────────────────────────────────────
 [[ $OPT_DRY -eq 0 ]] && {
+    if systemctl is-active --quiet irqbalance 2>/dev/null; then
+        IRQBALANCE_RESTORE="systemctl unmask irqbalance; systemctl enable irqbalance; systemctl start irqbalance"
+    elif systemctl is-enabled --quiet irqbalance 2>/dev/null; then
+        IRQBALANCE_RESTORE="systemctl unmask irqbalance; systemctl enable irqbalance"
+    fi
     systemctl stop    irqbalance 2>/dev/null && echo "[OK] irqbalance stopped" \
         || echo "[INFO] irqbalance not running"
     systemctl disable irqbalance 2>/dev/null || true
@@ -78,6 +120,8 @@ pin() {
         return 0
     }
     if [[ $OPT_DRY -eq 0 ]]; then
+        local prev; prev=$(cat "$f" 2>/dev/null || echo "")
+        [[ -n "$prev" ]] && snap "echo '$prev' > $f 2>/dev/null"
         echo "$cpu" > "$f" 2>/dev/null \
             && { [[ $OPT_VERBOSE -eq 1 ]] && printf "  IRQ %-5s → CPU %-3s  %s\n" "$irq" "$cpu" "$label"; true; } \
             || printf "  [WARN] IRQ %-5s write failed\n" "$irq"
@@ -390,6 +434,10 @@ if [[ $OPT_REDUCE -eq 1 ]]; then
 
         printf "  %-12s  %d → %d queues\n" "$iface" "$current" "$target"
         if [[ $OPT_DRY -eq 0 ]]; then
+            # IRQs removed by the reduction lose their affinity snapshot; on
+            # restore they reappear with default affinity and irqbalance (if
+            # restored) rebalances them.
+            snap "ip link set $iface down 2>/dev/null; ethtool -L $iface combined $current 2>/dev/null; ip link set $iface up 2>/dev/null"
             ip link set "$iface" down 2>/dev/null || true
             sleep 0.5
             ethtool -L "$iface" combined "$target" 2>/dev/null \
@@ -565,8 +613,10 @@ if command -v python3 >/dev/null 2>&1; then
             if [[ $OPT_DRY -eq 1 ]]; then
                 ((pinned++))
             else
+                prev=$(cat "$q_file" 2>/dev/null || echo "")
                 if echo "$mask" > "$q_file" 2>/dev/null; then
                     ((pinned++))
+                    [[ -n "$prev" && "$prev" != "$mask" ]] && snap "echo '$prev' > $q_file 2>/dev/null"
                 else
                     ((failed++))
                 fi
@@ -677,6 +727,8 @@ for iface in "${NICS[@]}"; do
                 printf "  [DRY] %-12s rings: RX %s→%s  TX %s→%s\n" \
                     "$iface" "$rx_cur" "$rx_max" "$tx_cur" "$tx_max"
             else
+                [[ "$rx_cur" =~ ^[0-9]+$ && "$tx_cur" =~ ^[0-9]+$ ]] && \
+                    snap "ethtool -G $iface rx $rx_cur tx $tx_cur 2>/dev/null"
                 err=$(ethtool -G "$iface" rx "$rx_max" tx "$tx_max" 2>&1)
                 if [[ $? -eq 0 ]]; then
                     printf "  %-12s rings set:  RX=%s TX=%s\n" "$iface" "$rx_max" "$tx_max"
@@ -703,7 +755,9 @@ for iface in "${NICS[@]}"; do
     if [[ $OPT_DRY -eq 1 ]]; then
         printf "  [DRY] %-12s adaptive-rx on\n" "$iface"
     else
+        prev_adap=$(ethtool -c "$iface" 2>/dev/null | awk '/^Adaptive RX:/{print $3}')
         if ethtool -C "$iface" adaptive-rx on 2>/dev/null; then
+            [[ "$prev_adap" == "off" ]] && snap "ethtool -C $iface adaptive-rx off 2>/dev/null"
             printf "  %-12s adaptive-rx: on\n" "$iface"
         else
             printf "  %-12s adaptive-rx: not supported by driver\n" "$iface"
@@ -1511,18 +1565,24 @@ fi
 cpu_vendor=$(awk -F': ' '/^vendor_id/{print $2; exit}' /proc/cpuinfo 2>/dev/null | xargs)
 if [[ "$cpu_vendor" == "GenuineIntel" ]]; then
     if command -v rdmsr >/dev/null 2>&1; then
-        ddio_msr=$(rdmsr -p 0 0xC8F 2>/dev/null | head -1 || echo "")
-        if [[ -z "$ddio_msr" ]]; then
-            printf "  Intel DDIO:     MSR 0xC8F unreadable (load msr module: modprobe msr)\n"
-        elif [[ "$ddio_msr" == "0" || "$ddio_msr" == "0x0" ]]; then
-            printf "  Intel DDIO:     MSR 0xC8F=%-8s  [WARN] DDIO appears disabled — NIC DMA bypasses L3\n" "$ddio_msr"
-            printf "                  [HINT] enable DDIO in BIOS/UEFI (Intel Direct Data I/O)\n"
+        # IIO_LLC_WAYS (0xC8B) = LLC ways allocated to DDIO inbound writes.
+        # Nonzero => DDIO active (popcount = number of ways). 0xC8F is NOT a
+        # DDIO register — reading it produced false "disabled" warnings. The
+        # global disable is iiomiscctrl Disable_All_Allocating_Flows, a PCIe
+        # config-space bit (not an MSR); on Xeon, DDIO is on by default.
+        ddio=$(rdmsr -p 0 0xC8B 2>/dev/null | head -1 | tr -d ' \n' || echo "")
+        if [[ -z "$ddio" ]]; then
+            printf "  Intel DDIO:     IIO_LLC_WAYS (0xC8B) unreadable (modprobe msr)\n"
+        elif [[ "$ddio" =~ ^0+$ ]]; then
+            printf "  Intel DDIO:     IIO_LLC_WAYS=0x%s  [WARN] 0 ways — DDIO disabled\n" "$ddio"
         else
-            printf "  Intel DDIO:     MSR 0xC8F=%-8s  [OK] NIC DMA targets L3 cache\n" "$ddio_msr"
+            dec=$((16#$ddio)); ways=0
+            while [[ $dec -gt 0 ]]; do ways=$(( ways + (dec & 1) )); dec=$(( dec >> 1 )); done
+            printf "  Intel DDIO:     IIO_LLC_WAYS=0x%s  [OK] DDIO active (%d LLC ways)\n" "$ddio" "$ways"
         fi
     else
         printf "  Intel DDIO:     [INFO] Intel CPU — DDIO state requires msr-tools (apt/yum: msr-tools)\n"
-        printf "                  [INFO] DDIO is on by default on Xeon Broadwell+ — verify in BIOS\n"
+        printf "                  [INFO] DDIO is on by default on Xeon Broadwell+ (no BIOS toggle on most platforms)\n"
     fi
 else
     printf "  Intel DDIO:     [INFO] non-Intel CPU (%s) — DDIO not applicable\n" "${cpu_vendor:-unknown}"
@@ -1614,4 +1674,9 @@ for iface in "${NICS[@]}"; do
     fi
 done
 
+if [[ -n "$RESTORE" ]]; then
+    [[ -n "$IRQBALANCE_RESTORE" ]] && echo "$IRQBALANCE_RESTORE" >> "$RESTORE"
+    echo 'echo "[restore] done — pre-run settings reapplied"' >> "$RESTORE"
+    echo "=== Restore script: $RESTORE  (run as root to roll back this run) ==="
+fi
 echo "=== DONE. Log: $LOG ==="
