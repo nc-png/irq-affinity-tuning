@@ -21,7 +21,6 @@
 # Usage:  ./irq-affinity-auto.sh [--reduce-queues] [--dry-run] [--verbose]
 # ===========================================================================
 set -uo pipefail
-[[ $EUID -ne 0 ]] && { echo "[ERROR] must run as root"; exit 1; }
 LOG="/var/log/irq-affinity.log"
 exec > >(tee -a "$LOG") 2>&1
 echo "=== $(date) ==="
@@ -42,8 +41,10 @@ done
 [[ $OPT_DRY -eq 1 ]] && echo "[DRY RUN] No changes will be applied"
 
 # ── Restore script ────────────────────────────────────────────────────────────
-# Every runtime write below snapshots the previous value into a rollback script
-# so a bad tuning run can be reverted without a reboot.
+# Every runtime write below (IRQ affinity, queue counts, XPS masks, rings,
+# coalescing, irqbalance) snapshots the previous value into a rollback script
+# so a bad tuning run can be reverted without a reboot.  snap() is a no-op in
+# dry-run, so every write site can call it unconditionally.
 RESTORE="" IRQBALANCE_RESTORE=""
 if [[ $OPT_DRY -eq 0 ]]; then
     # Atomic create (no -p): fails if /tmp/irq exists as anything, including a
@@ -120,7 +121,7 @@ pin() {
         return 0
     }
     if [[ $OPT_DRY -eq 0 ]]; then
-        local prev; prev=$(cat "$f" 2>/dev/null || echo "")
+        local prev; prev=$(cat "$f" 2>/dev/null)
         [[ -n "$prev" ]] && snap "echo '$prev' > $f 2>/dev/null"
         echo "$cpu" > "$f" 2>/dev/null \
             && { [[ $OPT_VERBOSE -eq 1 ]] && printf "  IRQ %-5s → CPU %-3s  %s\n" "$irq" "$cpu" "$label"; true; } \
@@ -147,6 +148,22 @@ weight_of() {
         bridge_member|ovs_port)  echo 2 ;;
         *)                       echo 2 ;;
     esac
+}
+
+# Role weight scaled by link speed.  Softirq work scales with line rate:
+# every RSS queue's GRO+TCP runs on the one core its IRQ is pinned to,
+# so a 100GE NIC sharing a node with a 40GE NIC of the same role must
+# get the lion's share of cores or per-flow throughput caps at a
+# fraction of one core's softirq capacity (observed: 64 IRQs of a 100GE
+# port squeezed onto 7 cores while an external 40GE port held 8).
+nic_weight() {  # <iface>
+    local w spd
+    w=$(weight_of "${NIC_ROLE[$1]}")
+    spd="${NIC_SPEED[$1]:-0}"
+    if   [[ $spd -ge 100000 ]]; then w=$(( w * 4 ))
+    elif [[ $spd -ge 50000  ]]; then w=$(( w * 2 ))
+    fi
+    echo "$w"
 }
 
 # ============================================================================
@@ -280,7 +297,7 @@ done
 # ── 2d: Pass 2 — for each PCI group, select highest-priority role ─────────────
 # Fixes the bug where eth2 (standalone, 82:00.4) was picked over
 # ext3 (bond_slave, 82:00.4) because eth2 sorts before ext3 alphabetically.
-declare -A NIC_PCI NIC_NUMA NIC_ROLE NIC_IRQS NIC_CORES
+declare -A NIC_PCI NIC_NUMA NIC_ROLE NIC_IRQS NIC_CORES NIC_SPEED
 declare -a NICS=()
 
 for pci in $(echo "${!P1_BY_PCI[@]}" | tr ' ' '\n' | sort); do
@@ -333,6 +350,9 @@ for pci in $(echo "${!P1_BY_PCI[@]}" | tr ' ' '\n' | sort); do
     NIC_NUMA[$best]="${P1_NUMA[$best]}"
     NIC_ROLE[$best]="${P1_ROLE[$best]}"
     NIC_IRQS[$best]="${irqs[*]}"
+    spd=$(cat "/sys/class/net/${best}/speed" 2>/dev/null || echo 0)
+    [[ "$spd" =~ ^[0-9]+$ ]] || spd=0
+    NIC_SPEED[$best]="$spd"
     NICS+=("$best")
 
     printf "  %-12s PCI=%-15s NUMA=%s  role=%-14s IRQs=%d\n" \
@@ -372,7 +392,7 @@ for node in $(echo "${!NODE_NICS[@]}" | tr ' ' '\n' | sort -n); do
 
     total_w=0
     for n in "${node_nics[@]}"; do
-        total_w=$(( total_w + $(weight_of "${NIC_ROLE[$n]}") ))
+        total_w=$(( total_w + $(nic_weight "$n") ))
     done
 
     echo "  NUMA $node | ${total} cores | ${#node_nics[@]} NIC(s) | total_weight=$total_w"
@@ -380,7 +400,7 @@ for node in $(echo "${!NODE_NICS[@]}" | tr ' ' '\n' | sort -n); do
 
     for i in "${!node_nics[@]}"; do
         n="${node_nics[$i]}"
-        w=$(weight_of "${NIC_ROLE[$n]}")
+        w=$(nic_weight "$n")
         remaining=$(( total - idx ))
         nics_left=$(( n_count - i - 1 ))
 
@@ -401,8 +421,8 @@ for node in $(echo "${!NODE_NICS[@]}" | tr ' ' '\n' | sort -n); do
         irq_count=${#irq_arr[@]}
         per_core=$(( (irq_count + n_cores - 1) / n_cores ))
 
-        printf "    %-12s role=%-14s weight=%d  cores=[%-20s]  %3d IRQs (~%d/core)\n" \
-            "$n" "${NIC_ROLE[$n]}" "$w" "${assigned[*]}" "$irq_count" "$per_core"
+        printf "    %-12s role=%-14s speed=%-7s weight=%d  cores=[%-20s]  %3d IRQs (~%d/core)\n" \
+            "$n" "${NIC_ROLE[$n]}" "${NIC_SPEED[$n]:-?}Mb" "$w" "${assigned[*]}" "$irq_count" "$per_core"
     done
 done
 
@@ -434,9 +454,6 @@ if [[ $OPT_REDUCE -eq 1 ]]; then
 
         printf "  %-12s  %d → %d queues\n" "$iface" "$current" "$target"
         if [[ $OPT_DRY -eq 0 ]]; then
-            # IRQs removed by the reduction lose their affinity snapshot; on
-            # restore they reappear with default affinity and irqbalance (if
-            # restored) rebalances them.
             snap "ip link set $iface down 2>/dev/null; ethtool -L $iface combined $current 2>/dev/null; ip link set $iface up 2>/dev/null"
             ip link set "$iface" down 2>/dev/null || true
             sleep 0.5
@@ -613,10 +630,11 @@ if command -v python3 >/dev/null 2>&1; then
             if [[ $OPT_DRY -eq 1 ]]; then
                 ((pinned++))
             else
-                prev=$(cat "$q_file" 2>/dev/null || echo "")
+                local_prev=$(cat "$q_file" 2>/dev/null)
+                [[ -n "$local_prev" && "$local_prev" != "$mask" ]] && \
+                    snap "echo '$local_prev' > $q_file 2>/dev/null"
                 if echo "$mask" > "$q_file" 2>/dev/null; then
                     ((pinned++))
-                    [[ -n "$prev" && "$prev" != "$mask" ]] && snap "echo '$prev' > $q_file 2>/dev/null"
                 else
                     ((failed++))
                 fi
@@ -756,8 +774,8 @@ for iface in "${NICS[@]}"; do
         printf "  [DRY] %-12s adaptive-rx on\n" "$iface"
     else
         prev_adap=$(ethtool -c "$iface" 2>/dev/null | awk '/^Adaptive RX:/{print $3}')
+        [[ "$prev_adap" == "off" ]] && snap "ethtool -C $iface adaptive-rx off 2>/dev/null"
         if ethtool -C "$iface" adaptive-rx on 2>/dev/null; then
-            [[ "$prev_adap" == "off" ]] && snap "ethtool -C $iface adaptive-rx off 2>/dev/null"
             printf "  %-12s adaptive-rx: on\n" "$iface"
         else
             printf "  %-12s adaptive-rx: not supported by driver\n" "$iface"
@@ -1674,9 +1692,16 @@ for iface in "${NICS[@]}"; do
     fi
 done
 
+# ============================================================================
+# Finalize restore script
+# irqbalance restore goes LAST so, on rollback, it can rebalance any IRQs that
+# a queue-count restore recreated with default affinity.
+# ============================================================================
 if [[ -n "$RESTORE" ]]; then
     [[ -n "$IRQBALANCE_RESTORE" ]] && echo "$IRQBALANCE_RESTORE" >> "$RESTORE"
     echo 'echo "[restore] done — pre-run settings reapplied"' >> "$RESTORE"
+    echo ""
     echo "=== Restore script: $RESTORE  (run as root to roll back this run) ==="
 fi
+
 echo "=== DONE. Log: $LOG ==="
