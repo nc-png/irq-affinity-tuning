@@ -1,6 +1,6 @@
 #!/bin/bash
 # ===========================================================================
-# irq-affinity-auto.sh  v5  —  Dynamic NUMA-aware IRQ affinity
+# irq-affinity-auto.sh  v5  —  Dynamic NUMA-aware IRQ affinity - author nc
 #
 # v5 fixes:
 #   1. /proc/net/bonding/ pre-scan detects bond slaves even when link is down
