@@ -19,6 +19,7 @@
 #   bridge_member / ovs_port / standalone → 2
 #
 # Usage:  ./irq-affinity-auto.sh [--reduce-queues] [--dry-run] [--verbose]
+#                                [--overlap-cores] [--no-adaptive-rx]
 # ===========================================================================
 set -uo pipefail
 LOG="/var/log/irq-affinity.log"
@@ -26,14 +27,21 @@ exec > >(tee -a "$LOG") 2>&1
 echo "=== $(date) ==="
 
 # ── CLI args ──────────────────────────────────────────────────────────────────
-OPT_REDUCE=0 OPT_DRY=0 OPT_VERBOSE=0
+OPT_REDUCE=0 OPT_DRY=0 OPT_VERBOSE=0 OPT_OVERLAP=0 OPT_NO_ADAPTIVE=0
 for arg in "$@"; do
     case "$arg" in
-        --reduce-queues) OPT_REDUCE=1   ;;
-        --dry-run)       OPT_DRY=1      ;;
-        --verbose|-v)    OPT_VERBOSE=1  ;;
+        --reduce-queues)  OPT_REDUCE=1      ;;
+        --dry-run)        OPT_DRY=1         ;;
+        --verbose|-v)     OPT_VERBOSE=1     ;;
+        --overlap-cores)  OPT_OVERLAP=1     ;;
+        --no-adaptive-rx) OPT_NO_ADAPTIVE=1 ;;
         --help|-h)
-            echo "Usage: $0 [--reduce-queues] [--dry-run] [--verbose]"
+            echo "Usage: $0 [--reduce-queues] [--dry-run] [--verbose] [--overlap-cores] [--no-adaptive-rx]"
+            echo "  --overlap-cores   heaviest NIC per NUMA node is pinned across the whole"
+            echo "                    node core pool (overlapping lighter NICs) instead of an"
+            echo "                    exclusive slice — for NICs in different bonds that do"
+            echo "                    not fire at the same time"
+            echo "  --no-adaptive-rx  do not touch interrupt coalescing (leave adaptive-rx as configured)"
             echo "Non-dry runs write a rollback script to /tmp/irq/restore_<date>_<time>.sh"
             exit 0 ;;
     esac
@@ -390,9 +398,11 @@ for node in $(echo "${!NODE_NICS[@]}" | tr ' ' '\n' | sort -n); do
     total=${#avail[@]}
     read -ra node_nics <<< "${NODE_NICS[$node]}"
 
-    total_w=0
+    total_w=0 max_w=0
     for n in "${node_nics[@]}"; do
-        total_w=$(( total_w + $(nic_weight "$n") ))
+        w=$(nic_weight "$n")
+        total_w=$(( total_w + w ))
+        [[ $w -gt $max_w ]] && max_w=$w
     done
 
     echo "  NUMA $node | ${total} cores | ${#node_nics[@]} NIC(s) | total_weight=$total_w"
@@ -414,15 +424,27 @@ for node in $(echo "${!NODE_NICS[@]}" | tr ' ' '\n' | sort -n); do
         fi
 
         assigned=("${avail[@]:$idx:$n_cores}")
-        NIC_CORES[$n]="${assigned[*]}"
         idx=$(( idx + n_cores ))
+
+        # --overlap-cores: the heaviest NIC(s) on the node span the full node
+        # pool instead of their exclusive slice.  Lighter NICs keep their slice,
+        # so the heavy NIC loses nothing to them — safe when the overlapping
+        # NICs sit in different bonds and do not fire at the same time.
+        # ponytail: ties (two max-weight NICs) both get the full pool; add
+        # per-bond grouping if same-bond heavies ever land on one node.
+        overlap_tag=""
+        if [[ $OPT_OVERLAP -eq 1 && $n_count -gt 1 && $w -eq $max_w ]]; then
+            assigned=("${avail[@]}")
+            overlap_tag=" (overlap: full node pool)"
+        fi
+        NIC_CORES[$n]="${assigned[*]}"
 
         read -ra irq_arr <<< "${NIC_IRQS[$n]}"
         irq_count=${#irq_arr[@]}
-        per_core=$(( (irq_count + n_cores - 1) / n_cores ))
+        per_core=$(( (irq_count + ${#assigned[@]} - 1) / ${#assigned[@]} ))
 
-        printf "    %-12s role=%-14s speed=%-7s weight=%d  cores=[%-20s]  %3d IRQs (~%d/core)\n" \
-            "$n" "${NIC_ROLE[$n]}" "${NIC_SPEED[$n]:-?}Mb" "$w" "${assigned[*]}" "$irq_count" "$per_core"
+        printf "    %-12s role=%-14s speed=%-7s weight=%d  cores=[%-20s]  %3d IRQs (~%d/core)%s\n" \
+            "$n" "${NIC_ROLE[$n]}" "${NIC_SPEED[$n]:-?}Mb" "$w" "${assigned[*]}" "$irq_count" "$per_core" "$overlap_tag"
     done
 done
 
@@ -770,7 +792,9 @@ for iface in "${NICS[@]}"; do
     fi
 
     # ── Adaptive RX coalescing ────────────────────────────────────────────────
-    if [[ $OPT_DRY -eq 1 ]]; then
+    if [[ $OPT_NO_ADAPTIVE -eq 1 ]]; then
+        printf "  %-12s adaptive-rx: [SKIP] left as configured (--no-adaptive-rx)\n" "$iface"
+    elif [[ $OPT_DRY -eq 1 ]]; then
         printf "  [DRY] %-12s adaptive-rx on\n" "$iface"
     else
         prev_adap=$(ethtool -c "$iface" 2>/dev/null | awk '/^Adaptive RX:/{print $3}')
