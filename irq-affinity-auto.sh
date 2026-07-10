@@ -19,7 +19,7 @@
 #   bridge_member / ovs_port / standalone → 2
 #
 # Usage:  ./irq-affinity-auto.sh [--reduce-queues] [--dry-run] [--verbose]
-#                                [--overlap-cores] [--no-adaptive-rx]
+#                                [--overlap-cores] [--no-adaptive-rx] [--softirq-siblings]
 # ===========================================================================
 set -uo pipefail
 LOG="/var/log/irq-affinity.log"
@@ -27,21 +27,25 @@ exec > >(tee -a "$LOG") 2>&1
 echo "=== $(date) ==="
 
 # ── CLI args ──────────────────────────────────────────────────────────────────
-OPT_REDUCE=0 OPT_DRY=0 OPT_VERBOSE=0 OPT_OVERLAP=0 OPT_NO_ADAPTIVE=0
+OPT_REDUCE=0 OPT_DRY=0 OPT_VERBOSE=0 OPT_OVERLAP=0 OPT_NO_ADAPTIVE=0 OPT_SIBLINGS=0
 for arg in "$@"; do
     case "$arg" in
-        --reduce-queues)  OPT_REDUCE=1      ;;
-        --dry-run)        OPT_DRY=1         ;;
-        --verbose|-v)     OPT_VERBOSE=1     ;;
-        --overlap-cores)  OPT_OVERLAP=1     ;;
-        --no-adaptive-rx) OPT_NO_ADAPTIVE=1 ;;
+        --reduce-queues)     OPT_REDUCE=1      ;;
+        --dry-run)           OPT_DRY=1         ;;
+        --verbose|-v)        OPT_VERBOSE=1     ;;
+        --overlap-cores)     OPT_OVERLAP=1     ;;
+        --no-adaptive-rx)    OPT_NO_ADAPTIVE=1 ;;
+        --softirq-siblings)  OPT_SIBLINGS=1    ;;
         --help|-h)
-            echo "Usage: $0 [--reduce-queues] [--dry-run] [--verbose] [--overlap-cores] [--no-adaptive-rx]"
-            echo "  --overlap-cores   heaviest NIC per NUMA node is pinned across the whole"
-            echo "                    node core pool (overlapping lighter NICs) instead of an"
-            echo "                    exclusive slice — for NICs in different bonds that do"
-            echo "                    not fire at the same time"
-            echo "  --no-adaptive-rx  do not touch interrupt coalescing (leave adaptive-rx as configured)"
+            echo "Usage: $0 [--reduce-queues] [--dry-run] [--verbose] [--overlap-cores] [--no-adaptive-rx] [--softirq-siblings]"
+            echo "  --overlap-cores    heaviest NIC per NUMA node is pinned across the whole"
+            echo "                     node core pool (overlapping lighter NICs) instead of an"
+            echo "                     exclusive slice — for NICs in different bonds that do"
+            echo "                     not fire at the same time"
+            echo "  --no-adaptive-rx   do not touch interrupt coalescing (leave adaptive-rx as configured)"
+            echo "  --softirq-siblings pin IRQs on each core's second hyperthread instead of the"
+            echo "                     primary — for hosts whose application pins its workers to"
+            echo "                     the primaries; no effect when SMT is off"
             echo "Non-dry runs write a rollback script to /tmp/irq/restore_<date>_<time>.sh"
             exit 0 ;;
     esac
@@ -121,6 +125,12 @@ is_physical_core() {
     [[ "$first" == "$cpu" ]]
 }
 
+ht_sibling() {  # <cpu> → highest CPU sharing the physical core (== cpu when SMT off)
+    local f="/sys/devices/system/cpu/cpu${1}/topology/thread_siblings_list"
+    [[ -f "$f" ]] || { echo "$1"; return; }
+    expand_cpulist "$(cat "$f")" | tr ' ' '\n' | sort -n | tail -1
+}
+
 pin() {
     local irq="$1" cpu="$2" label="${3:-}"
     local f="/proc/irq/${irq}/smp_affinity_list"
@@ -195,9 +205,28 @@ for node_dir in /sys/devices/system/node/node[0-9]*/; do
 
     reserved="${physical[0]}"
     avail=("${physical[@]:1}")
+    pool_tag=""
+    # --softirq-siblings: replace each pool core with its HT sibling so NIC
+    # softirq never shares a run-queue with application workers pinned to the
+    # primaries (measured: halved node softirq under race load, p3 2026-07-11).
+    # The reserved core's sibling stays out of the pool because its primary was
+    # dropped above.  SMT off → ht_sibling returns the primary → identical to
+    # the default node-wide spread.
+    if [[ $OPT_SIBLINGS -eq 1 ]]; then
+        mapped=() smt_seen=0
+        for cpu in "${avail[@]}"; do
+            sib=$(ht_sibling "$cpu")
+            [[ "$sib" != "$cpu" ]] && smt_seen=1
+            mapped+=("$sib")
+        done
+        avail=("${mapped[@]}")
+        if [[ $smt_seen -eq 1 ]]; then pool_tag=" (HT siblings)"
+        else pool_tag=" (SMT off — --softirq-siblings no effect)"
+        fi
+    fi
     NUMA_AVAIL_CORES[$node]="${avail[*]}"
-    printf "  NUMA %s: %d physical cores | OS reserved: CPU %s | NIC pool: %s\n" \
-        "$node" "${#physical[@]}" "$reserved" "${avail[*]}"
+    printf "  NUMA %s: %d physical cores | OS reserved: CPU %s | NIC pool: %s%s\n" \
+        "$node" "${#physical[@]}" "$reserved" "${avail[*]}" "$pool_tag"
 done
 
 # ============================================================================
