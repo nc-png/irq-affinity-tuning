@@ -30,3 +30,13 @@ out=$(run 1)
     || { echo "FAIL overlap: $out"; exit 1; }
 
 echo "PASS: default partitions exclusively; --overlap-cores gives ext2 the full NUMA0 pool, ext0 keeps 1-3, single-NIC node unchanged"
+
+# --softirq-siblings: ht_sibling must agree with lscpu on the real topology
+# (highest CPU per NODE+CORE pair; own CPU when SMT is off).
+eval "$(sed -n '/^expand_cpulist/,/^}/p; /^ht_sibling/,/^}/p' irq-affinity-auto.sh)"
+while read -r cpu node core; do
+    want=$(lscpu -e=CPU,NODE,CORE | awk -v n="$node" -v c="$core" '$2==n && $3==c {m=$1>m?$1:m} END{print m}')
+    got=$(ht_sibling "$cpu")
+    [[ "$got" == "$want" ]] || { echo "FAIL ht_sibling cpu$cpu: got $got want $want"; exit 1; }
+done < <(lscpu -e=CPU,NODE,CORE | tail -n +2)
+echo "PASS: ht_sibling matches lscpu for all $(nproc) CPUs"
