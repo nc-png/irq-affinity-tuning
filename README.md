@@ -58,7 +58,7 @@ For reading the output, the run is numbered 1–17. Short version:
 |---|---|
 | 1–3 | NUMA topology, NIC discovery (bond/OVS/bridge role detection), core allocation weighted by role |
 | 3b | Queue reduction (`--reduce-queues` only) |
-| 4, 4b | IRQ pinning, XPS |
+| 4, 4b | IRQ pinning (data queues first, one per thread; other vectors after), XPS |
 | 5 | Verification — re-reads what was just written |
 | 6 | Ring buffers + adaptive-rx (last phase that writes anything) |
 | 7–17 | Diagnostics: link/FEC, PCIe, offloads, kernel tunables, bond RFS, system health, rings/coalescing report, RSS indirection, conntrack, memory/sysctls, RDMA/RoCE/XDP |

@@ -189,7 +189,7 @@ nic_weight() {  # <iface>
 # ============================================================================
 echo ""
 echo "=== Phase 1: NUMA Topology ==="
-declare -A NUMA_AVAIL_CORES
+declare -A NUMA_AVAIL_CORES NUMA_SPARE
 
 for node_dir in /sys/devices/system/node/node[0-9]*/; do
     node=$(basename "$node_dir" | tr -d 'node')
@@ -225,6 +225,18 @@ for node_dir in /sys/devices/system/node/node[0-9]*/; do
         fi
     fi
     NUMA_AVAIL_CORES[$node]="${avail[*]}"
+    # Threads on the node outside the pool, in borrow order: HT siblings
+    # first, then primaries from the top down (the application's flow-aware
+    # mask fills low cores first).  Phase 4 takes from here only when a NIC
+    # has more data queues than cores — e.g. cxgb4's fixed 16 RSS queues on
+    # a 14-core node (ethtool -L unsupported), so 16-on-16 is the only way
+    # to keep one data queue per thread.
+    spare=() spare_pri=()
+    for cpu in "${all_cpus[@]}"; do
+        [[ " ${avail[*]} " == *" $cpu "* ]] && continue
+        if is_physical_core "$cpu"; then spare_pri+=("$cpu"); else spare+=("$cpu"); fi
+    done
+    NUMA_SPARE[$node]="${spare[*]} $(printf '%s\n' "${spare_pri[@]}" | tac | tr '\n' ' ')"
     printf "  NUMA %s: %d physical cores | OS reserved: CPU %s | NIC pool: %s%s\n" \
         "$node" "${#physical[@]}" "$reserved" "${avail[*]}" "$pool_tag"
 done
@@ -538,8 +550,12 @@ fi
 
 # ============================================================================
 # Phase 4 — IRQ pinning
-# Async IRQs → first core (management plane, low traffic)
-# Comp/data IRQs → round-robin across allocated cores
+# Data (RSS) queue IRQs first, one per core, never doubled — identified by
+# the driver's own label in /proc/interrupts:
+#   cxgb4  "ext1 (queue 3)"    mlx5  "mlx5_comp3@pci:..."    mlx4  "ext1-3"
+# Everything else (firmware, ULD/offload, async, the card's other port)
+# round-robins over the same cores after them.  A NIC with more data queues
+# than cores borrows from NUMA_SPARE (see Phase 1) rather than doubling up.
 # ============================================================================
 echo ""
 echo "=== Phase 4: IRQ Pinning ==="
@@ -554,25 +570,61 @@ for iface in "${NICS[@]}"; do
 
     read -ra cores <<< "$cores_str"
     read -ra all_irqs <<< "$irqs_str"
-    n_cores=${#cores[@]}
-    idx=0 pinned=0
 
     echo ""
     echo "  --- $iface (NUMA ${NIC_NUMA[$iface]}, ${NIC_ROLE[$iface]}) ---"
 
+    # IRQ → label, one pass; strips the per-CPU counters and chip columns so
+    # labels with spaces ("ext1 (queue 3)") survive intact.
+    declare -A label=()
+    while read -r irq lbl; do label[$irq]="$lbl"; done < <(
+        grep -iF "${NIC_PCI[$iface]}" /proc/interrupts 2>/dev/null \
+        | sed -E 's/^ *([0-9]+):( +[0-9]+)+ +[^ ]+ +[^ ]+ +/\1 /')
+
+    data=() rest=()
     for irq in "${all_irqs[@]}"; do
-        irq_name=$(grep -m1 "^ *${irq}:" /proc/interrupts 2>/dev/null | awk '{print $NF}')
-        if echo "$irq_name" | grep -q "async"; then
+        if [[ "${label[$irq]:-}" =~ ^(${iface}\ \(queue\ [0-9]+\)|${iface}-[0-9]+|mlx5_comp[0-9]+.*)$ ]]; then
+            data+=("$irq")
+        else
+            rest+=("$irq")
+        fi
+    done
+
+    # ponytail: two NICs on one node both borrow from the same spare list;
+    # split it per NIC if that ever happens.
+    if [[ ${#data[@]} -gt ${#cores[@]} ]]; then
+        read -ra spare <<< "${NUMA_SPARE[${NIC_NUMA[$iface]}]:-}"
+        borrowed=("${spare[@]:0:$(( ${#data[@]} - ${#cores[@]} ))}")
+        cores+=("${borrowed[@]}")
+        NIC_CORES[$iface]="${cores[*]}"
+        printf "  [INFO] %d data queues > %d cores — borrowed [%s] from the node\n" \
+            "${#data[@]}" "$(( ${#cores[@]} - ${#borrowed[@]} ))" "${borrowed[*]}"
+        [[ ${#data[@]} -gt ${#cores[@]} ]] && \
+            printf "  [WARN] node exhausted: %d data queues on %d cores — some will double up\n" \
+                "${#data[@]}" "${#cores[@]}"
+    fi
+
+    n_cores=${#cores[@]}
+    idx=0 pinned=0
+    for irq in "${data[@]}"; do
+        cpu="${cores[$((idx % n_cores))]}"
+        idx=$((idx + 1))
+        pin "$irq" "$cpu" "${label[$irq]:-}"
+        pinned=$((pinned + 1))
+        printf "  data  IRQ %-5s → CPU %-3s  %s\n" "$irq" "$cpu" "${label[$irq]:-}"
+    done
+    for irq in "${rest[@]}"; do
+        if [[ "${label[$irq]:-}" == *async* ]]; then
             cpu="${cores[0]}"
         else
             cpu="${cores[$((idx % n_cores))]}"
-            ((idx++))
+            idx=$((idx + 1))
         fi
-        pin "$irq" "$cpu" "$irq_name"
-        ((pinned++))
+        pin "$irq" "$cpu" "${label[$irq]:-}"
+        pinned=$((pinned + 1))
     done
 
-    echo "  [OK] $iface: $pinned IRQs → cores: [$cores_str]"
+    echo "  [OK] $iface: ${#data[@]} data + ${#rest[@]} other IRQs → cores: [${cores[*]}]"
 done
 
 # ============================================================================
