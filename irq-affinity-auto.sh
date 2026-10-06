@@ -1134,6 +1134,8 @@ done
 # napi_defer_hard_irqs (kernel 5.11+): defers hard IRQ re-arming for N NAPI
 #      polls. Combined with a non-zero gro_flush_timeout this is often the
 #      single biggest CPU-reduction win for receive-heavy 100GE workloads.
+# root qdisc: must be mq/mqprio on multi-queue NICs; any other root puts every
+#      TX queue behind one qdisc spinlock (cross-NUMA cache-line bouncing).
 # ============================================================================
 echo ""
 echo "=== Phase 10: Per-Interface Kernel Tunables ==="
@@ -1172,6 +1174,21 @@ for iface in "${NICS[@]}"; do
         for h in "${hints[@]}"; do
             printf "  %-12s        [HINT] %s\n" "" "$h"
         done
+    fi
+
+    # Root qdisc: a classful/single root (htb, prio, fq_codel...) serializes all
+    # TX queues behind one qdisc spinlock, cancelling XPS. mq/mqprio give each
+    # TX queue its own child qdisc and lock.
+    command -v tc >/dev/null 2>&1 || continue
+    ntxq=$(find "/sys/class/net/${iface}/queues" -maxdepth 1 -name 'tx-*' 2>/dev/null | wc -l)
+    root=$(tc qdisc show dev "$iface" root 2>/dev/null | awk 'NR==1{print $2}')
+    root=${root:-?}
+    if [[ "$root" == "mq" || "$root" == "mqprio" || "$root" == "?" || $ntxq -le 1 ]]; then
+        printf "  %-12s root qdisc=%-8s txq=%-4s [OK]\n" "$iface" "$root" "$ntxq"
+    else
+        printf "  %-12s root qdisc=%-8s txq=%-4s [WARN] single qdisc lock across all TX queues\n" \
+            "$iface" "$root" "$ntxq"
+        printf "  %-12s        [HINT] tc qdisc replace dev %s root mq\n" "" "$iface"
     fi
 done
 
